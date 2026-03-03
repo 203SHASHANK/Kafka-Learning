@@ -1,0 +1,98 @@
+# Single-Node Kafka in KRaft Mode
+# ================================
+# KRaft (Kafka Raft) removes the dependency on Apache ZooKeeper.
+# It is the standard since Kafka 3.3 and is required from Kafka 4.0.
+#
+# This setup is perfect for:
+#   - Local development and learning
+#   - Running examples in this repository
+#   - Integration testing
+#
+# Start:  make docker-up
+# Stop:   make docker-down  (also removes volumes)
+# UI:     http://localhost:8080
+
+services:
+
+  # ── Kafka Broker (KRaft mode) ─────────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.7.0
+    hostname: kafka
+    container_name: kafka
+    ports:
+      - "9092:9092"     # External: your Go code connects here
+      - "9101:9101"     # JMX: for monitoring tools
+    environment:
+      # KRaft: this node acts as both broker and controller.
+      # In production clusters, controllers and brokers are usually separate nodes.
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: "broker,controller"
+
+      # The controller quorum. In single-node: just this node.
+      # In multi-node (see ../multi-node/), list all controllers here.
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:29093"
+
+      # Listener configuration:
+      #   PLAINTEXT       – used for internal broker-to-broker traffic
+      #   CONTROLLER      – used by KRaft controller protocol
+      #   PLAINTEXT_HOST  – used by your Go code on the host machine
+      KAFKA_LISTENERS: "PLAINTEXT://kafka:29092,CONTROLLER://kafka:29093,PLAINTEXT_HOST://0.0.0.0:9092"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+
+      # Cluster ID must be a base64-encoded UUID. Generate with:
+      #   docker run --rm confluentinc/cp-kafka:7.7.0 kafka-storage random-uuid
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+
+      # Single-node: replicate everything to the one broker we have.
+      # Never use replication factor 1 in production—broker failure = data loss.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      # Allow auto-creation for learning. In production: disable this and
+      # create topics explicitly with the correct partition/replication settings.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_DELETE_TOPIC_ENABLE: "true"
+
+      # Data storage path
+      KAFKA_LOG_DIRS: "/tmp/kraft-combined-logs"
+
+      # Retention: keep messages for 24 hours (adjust for your use case)
+      KAFKA_LOG_RETENTION_HOURS: 24
+
+      # JMX for metrics scraping
+      KAFKA_JMX_PORT: 9101
+      KAFKA_JMX_HOSTNAME: localhost
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # ── Kafka UI ──────────────────────────────────────────────────────────────
+  # Kafka UI lets you visually inspect topics, browse messages,
+  # monitor consumer groups and lag. Extremely useful while learning.
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_METRICS_PORT: 9101
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: on-failure
+
+volumes:
+  kafka-data:
+    driver: local

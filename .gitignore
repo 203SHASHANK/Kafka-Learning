@@ -1,0 +1,41 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+
+# Test binary
+*.test
+
+# Coverage
+*.out
+coverage.html
+
+# Environment variables - NEVER commit real .env files
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Logs
+*.log
+
+# Docker volumes data
+docker/volumes/
+
+# Build artifacts
+dist/
+
+# Go workspace
+go.work
+go.work.sum
