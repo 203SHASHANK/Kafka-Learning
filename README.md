@@ -18,25 +18,31 @@ You are a Go developer who wants to:
 
 ## What is Kafka?
 
-Apache Kafka is a **distributed event streaming platform**. Think of it as a
-high-performance, durable message bus for your microservices.
+Apache Kafka is a **distributed event streaming platform** originally developed at LinkedIn and open-sourced in 2011. It is now maintained by the Apache Software Foundation. Think of it as a high-performance, durable, fault-tolerant message bus for your microservices — but one that also acts as a **persistent, replayable log**.
+
+The core insight behind Kafka's design: instead of deleting a message after it is consumed (like RabbitMQ or SQS), Kafka **appends messages to an immutable, ordered log on disk** and retains them for a configurable period. Consumers track their own position (offset) in that log. This means:
+
+- A consumer can **replay history** from any point — useful for rebuilding state, backfilling new services, or debugging production incidents
+- Multiple independent consumer groups each maintain their own offset — they don't interfere with each other
+- A slow consumer doesn't block a fast one
+- Kafka brokers are stateless with respect to consumer progress — consumers own their offsets
 
 Unlike traditional queues (RabbitMQ, SQS):
-- Messages are **retained on disk** (for hours, days, or forever) — consumers
-  can replay history
-- A topic is split into **partitions** — enabling horizontal scaling
-- Multiple independent consumer groups can each read the same topic — decoupled consumers
-- Kafka handles **millions of messages per second** — designed for throughput
+- Messages are **retained on disk** (for hours, days, or forever) — consumers can replay history
+- A topic is split into **partitions** — enabling horizontal scaling and true parallelism
+- Multiple independent consumer groups can each read the same topic — fully decoupled consumers
+- Kafka handles **millions of messages per second** — designed for throughput, not just latency
+- The broker is dumb, the client is smart — Kafka pushes complexity to producers/consumers, keeping the broker fast
 
 **When should you use Kafka?**
-| Use Case | Good Fit? |
-|---|---|
-| Async communication between microservices | ✅ |
-| Event sourcing and audit logs | ✅ |
-| Real-time data pipelines | ✅ |
-| High-throughput metrics and telemetry | ✅ |
-| Simple task queues with one consumer | ❌ (use Redis/SQS) |
-| RPC / request-response patterns | ❌ (use gRPC) |
+| Use Case | Good Fit? | Why |
+|---|---|---|
+| Async communication between microservices | ✅ | Decouples services; producer doesn't wait for consumer |
+| Event sourcing and audit logs | ✅ | Immutable log is a natural fit; replay to rebuild state |
+| Real-time data pipelines | ✅ | High throughput, low latency, fan-out to multiple consumers |
+| High-throughput metrics and telemetry | ✅ | Handles millions of events/sec with compression |
+| Simple task queues with one consumer | ❌ (use Redis/SQS) | Kafka's overhead isn't justified for simple work queues |
+| RPC / request-response patterns | ❌ (use gRPC) | Kafka is fire-and-forget; correlation is complex |
 
 ---
 
@@ -60,13 +66,14 @@ Unlike traditional queues (RabbitMQ, SQS):
 ```
 
 **Key concepts at a glance:**
-- **Broker**: A Kafka server that stores data and serves clients
-- **Topic**: A named stream of records (like a database table)
-- **Partition**: A topic is divided into N ordered logs (enables parallelism)
-- **Offset**: A message's unique sequential position within a partition
-- **Producer**: Writes messages to topics
-- **Consumer**: Reads messages from topics
-- **Consumer Group**: Multiple consumers sharing the work of consuming a topic
+- **Broker**: A Kafka server (JVM process) that stores partition data on disk and serves producer/consumer requests. A cluster has 1–N brokers. One broker per partition is elected **leader** — all reads and writes go through the leader.
+- **Topic**: A named, append-only stream of records. Analogous to a database table, but immutable and ordered. Topics are split into partitions for scalability.
+- **Partition**: The unit of parallelism. A topic with N partitions can be consumed by up to N consumers in parallel. Each partition is an ordered, immutable sequence of records. Ordering is guaranteed **within** a partition, not across partitions.
+- **Offset**: A message's unique, monotonically increasing integer position within a partition. Offset 0 is the first message ever written. Consumers commit offsets to track progress — on restart, they resume from the last committed offset.
+- **Replica**: A copy of a partition stored on a different broker for fault tolerance. One replica is the **leader** (serves traffic); others are **followers** (replicate from leader). The set of in-sync followers is the **ISR (In-Sync Replicas)**.
+- **Producer**: A client that writes (appends) messages to a topic. The producer decides which partition to write to — by round-robin, by message key hash, or by custom partitioner.
+- **Consumer**: A client that reads messages from a topic by polling. Consumers track their own offset per partition. They never "receive" messages — they **pull** them.
+- **Consumer Group**: A named group of consumer instances that collectively consume a topic. Kafka assigns each partition to exactly one consumer in the group — no two consumers in the same group read the same partition simultaneously. This is how Kafka achieves parallel consumption without duplicate processing.
 
 ---
 
@@ -291,42 +298,95 @@ All configuration is via environment variables. See `.env.example` for the full 
 
 ### Producer Acknowledgements (`acks`)
 
+The `acks` setting controls how many broker acknowledgements the producer waits for before considering a write successful. It is the primary knob for trading **durability vs. latency**.
+
 ```
-acks=0 (none)   → Fire-and-forget. Fastest. No guarantee.
-acks=1 (local)  → Leader writes to disk, then acks. Good default.
-acks=-1 (all)   → All ISR replicas write, then acks. Most durable. Use for critical events.
+acks=0 (none)   → Fire-and-forget. Producer doesn't wait for any ack.
+                  Fastest (no round-trip). Risk: message lost if broker crashes before writing.
+                  Use for: high-volume metrics where occasional loss is acceptable.
+
+acks=1 (local)  → Leader writes to its local log, then acks.
+                  Good balance of speed and safety. Risk: message lost if leader crashes
+                  before followers replicate. Use for: general-purpose events.
+
+acks=-1 (all)   → Leader waits for ALL in-sync replicas (ISR) to write, then acks.
+                  Most durable. Latency = slowest ISR replica. Risk: none under normal ops.
+                  Use for: financial events, inventory changes, anything you can't lose.
+                  Pair with: min.insync.replicas=2 to prevent acking with only 1 replica.
 ```
 
 ### Offset Management
 
+An offset is just an integer — the position of a message in a partition. Kafka stores committed offsets in an internal topic called `__consumer_offsets`. When a consumer restarts, it reads its last committed offset from there and resumes.
+
 ```go
 // Auto-commit (NOT recommended for production)
-cfg.Consumer.Offsets.AutoCommit.Enable = true   // commits on timer
+// Sarama commits on a timer (default: every 1s) regardless of whether
+// your handler succeeded. If your process crashes mid-batch, messages
+// between the last auto-commit and the crash are lost.
+cfg.Consumer.Offsets.AutoCommit.Enable = true
 
 // Manual commit (RECOMMENDED — at-least-once delivery)
+// You control exactly when an offset is committed.
+// If your process crashes before committing, the message is redelivered.
 cfg.Consumer.Offsets.AutoCommit.Enable = false
-// Then in your handler:
-session.MarkMessage(msg, "")  // stages offset for next commit
-session.Commit()              // optional: immediately flush to Kafka
+// In your handler — after successful processing:
+session.MarkMessage(msg, "")  // stages offset in memory (batched)
+session.Commit()              // optional: force immediate flush to __consumer_offsets
+// Without explicit Commit(), sarama flushes staged offsets on the next
+// auto-commit tick OR at session end (rebalance/shutdown).
 ```
 
 ### Delivery Guarantees
 
-| Mode | How | Risk |
-|---|---|---|
-| **At-most-once** | Commit before processing | Messages can be lost |
-| **At-least-once** | Commit after processing | Messages can be duplicated |
-| **Exactly-once** | Transactions + read_committed | Most expensive, safest |
+Delivery guarantees describe what happens when things go wrong (crashes, network partitions, retries).
+
+| Mode | How | Risk | When to use |
+|---|---|---|---|
+| **At-most-once** | Commit offset before processing | Message lost if handler crashes after commit | Metrics, logs where loss is acceptable |
+| **At-least-once** | Commit offset after successful processing | Message redelivered if crash before commit → duplicate processing | Most business events — make handlers idempotent |
+| **Exactly-once** | Kafka transactions + `isolation.level=read_committed` | Highest latency and complexity | Financial ledgers, inventory, anything where duplicates cause real harm |
+
+The practical recommendation: **design for at-least-once, make handlers idempotent**. Exactly-once is expensive and rarely necessary if your handler can safely process the same message twice (e.g., upsert by ID instead of insert).
+
+### Consumer Group Rebalancing
+
+A **rebalance** is triggered whenever the group membership changes: a consumer joins, leaves, or crashes. During a rebalance, all consumers in the group stop consuming, partitions are reassigned, and consumption resumes. This is a brief pause — typically under a second with the default `RoundRobin` strategy.
+
+The **Sticky** rebalance strategy (`sarama.NewBalanceStrategySticky()`) minimizes partition movement: consumers keep their existing partitions where possible, only moving the minimum necessary. This is important for stateful consumers that maintain per-partition caches.
 
 ### Consumer Scaling Rules
 
+The maximum useful parallelism for a consumer group equals the number of partitions. Adding more consumers than partitions wastes resources.
+
 ```
 partitions = 6
-consumers = 1 → consumer owns all 6 partitions
-consumers = 3 → 2 partitions each
+consumers = 1 → consumer owns all 6 partitions (no parallelism)
+consumers = 3 → 2 partitions each (good balance)
 consumers = 6 → 1 partition each (maximum parallelism)
-consumers = 7 → 1 consumer idle (extra consumers don't help)
+consumers = 7 → 6 active + 1 idle (idle consumer is on standby — useful for failover)
+
+Rule: set partitions at topic creation time based on your peak consumer count.
+You can increase partitions later, but it breaks key-based ordering guarantees.
 ```
+
+### Message Keys and Partitioning
+
+When a producer sends a message with a key, Kafka hashes the key to determine the partition: `partition = hash(key) % numPartitions`. This guarantees that **all messages with the same key always land in the same partition**, and therefore are consumed in order by the same consumer.
+
+```
+Key = "user-123" → always → Partition 2 → always → Consumer B
+Key = "user-456" → always → Partition 0 → always → Consumer A
+
+Use case: all events for a given user/order/entity go to the same partition,
+so a single consumer sees them in order — enabling stateful stream processing.
+
+No key (nil) → round-robin across partitions → maximum throughput, no ordering guarantee.
+```
+
+### Log Compaction
+
+By default, Kafka retains messages for a time period (`retention.ms`) or until a size limit (`retention.bytes`). But topics can also be configured with `cleanup.policy=compact`. A **compacted topic** retains only the latest message per key — older messages with the same key are garbage collected. This turns Kafka into a **key-value store** where the log is the source of truth. Useful for: configuration topics, user profile snapshots, CDC (change data capture) streams.
 
 ---
 
@@ -431,15 +491,27 @@ func main() {
 
 ## Testing Kafka Code
 
-### Unit Tests (mock sarama)
+### Unit Tests (mock IBM/sarama)
+
+The `github.com/IBM/sarama/mocks` package provides in-process mock implementations of producers and consumers. No broker required — tests run fast and deterministically.
 
 ```go
-// Use sarama's mock library for unit tests
+// Use IBM/sarama's mock library for unit tests
 import "github.com/IBM/sarama/mocks"
 
 func TestOrderHandler(t *testing.T) {
     mockConsumer := mocks.NewConsumer(t, nil)
-    // ... test your handler without a real broker
+    // Set expectations: which messages will be delivered
+    mockConsumer.ExpectConsumePartition("orders", 0, sarama.OffsetNewest).
+        YieldMessage(&sarama.ConsumerMessage{Value: []byte(`{"id":"1"}`)})
+    // ... test your handler logic without a real broker
+}
+
+func TestProducer(t *testing.T) {
+    mockProducer := mocks.NewSyncProducer(t, nil)
+    // Assert the producer sends exactly one message to the correct topic
+    mockProducer.ExpectSendMessageAndSucceed()
+    // ... call your production code that uses the producer
 }
 ```
 
@@ -510,13 +582,34 @@ make create-topics
 
 ---
 
+## About the Go Client: IBM/sarama
+
+This repository uses **[`github.com/IBM/sarama`](https://github.com/IBM/sarama)** — the most widely used pure-Go Kafka client.
+
+Brief history: the library was originally created as `Shopify/sarama` by Shopify. In 2023, IBM took over maintenance and the canonical import path became `github.com/IBM/sarama`. The library itself is unchanged in behavior — only the import path and maintainer changed. If you see older code using `github.com/Shopify/sarama`, it is the same library.
+
+Key characteristics of IBM/sarama:
+- Pure Go — no CGo, no native dependencies, single binary deployment
+- Low-level API — gives you full control over partitions, offsets, and configs
+- Implements the full Kafka protocol including transactions and exactly-once semantics
+- Provides `sarama/mocks` for unit testing without a real broker
+- Actively maintained with support for Kafka 0.8 through 3.x
+
+Alternative Go clients (for awareness):
+- [`confluent-kafka-go`](https://github.com/confluentinc/confluent-kafka-go) — wraps the C `librdkafka` library via CGo; higher throughput ceiling but adds a native dependency
+- [`franz-go`](https://github.com/twmb/franz-go) — newer pure-Go client with a more ergonomic API and excellent performance; worth evaluating for new projects
+
+---
+
 ## Further Reading
 
-- [Kafka Documentation](https://kafka.apache.org/documentation/) — official reference
-- [IBM/sarama](https://github.com/IBM/sarama) — Go Kafka client we use
-- [Kafka: The Definitive Guide](https://www.oreilly.com/library/view/kafka-the-definitive/9781491936153/) — comprehensive book
-- [Designing Event-Driven Systems](https://www.oreilly.com/library/view/designing-event-driven-systems/9781492038252/) — patterns and architecture
-- [Kafka Improvement Proposals](https://cwiki.apache.org/confluence/display/KAFKA/Kafka+Improvement+Proposals) — understand design decisions
+- [Apache Kafka Documentation](https://kafka.apache.org/documentation/) — official reference for all broker configs, APIs, and protocols
+- [IBM/sarama on GitHub](https://github.com/IBM/sarama) — the Go Kafka client used in this repo (formerly Shopify/sarama)
+- [IBM/sarama API docs](https://pkg.go.dev/github.com/IBM/sarama) — full Go package documentation
+- [Kafka: The Definitive Guide (free PDF)](https://www.confluent.io/resources/kafka-the-definitive-guide/) — comprehensive book covering internals, operations, and patterns
+- [Designing Event-Driven Systems](https://www.oreilly.com/library/view/designing-event-driven-systems/9781492038252/) — patterns and architecture for event-driven microservices
+- [Kafka Improvement Proposals (KIPs)](https://cwiki.apache.org/confluence/display/KAFKA/Kafka+Improvement+Proposals) — understand the design decisions behind every Kafka feature
+- [Jay Kreps — The Log](https://engineering.linkedin.com/distributed-systems/log-what-every-software-engineer-should-know-about-real-time-datas-unifying) — the foundational essay explaining why the append-only log is such a powerful abstraction
 
 ---
 
