@@ -16,7 +16,7 @@ services:
   # ── JMX Exporter ─────────────────────────────────────────────────────────
   # Translates Kafka's JMX metrics into Prometheus format.
   jmx-exporter:
-    image: bitnami/jmx-exporter:latest
+    image: soldevelo/jmx-exporter:latest
     container_name: jmx-exporter
     ports:
       - "5556:5556"
